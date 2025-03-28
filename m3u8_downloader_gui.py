@@ -1101,24 +1101,15 @@ class DownloadManagerApp:
 
         action_frame = ttk.Frame(self.root, padding="5 10")
         action_frame.pack(fill=tk.X, side=tk.TOP)
-        start_button = ttk.Button(
-            action_frame, text="Start Selected", command=self.start_selected_downloads)
-        start_button.pack(side=tk.LEFT, padx=5)
-        # Queue Toggle Button
-        self.start_pause_queue_button = ttk.Button(
-            action_frame, text="Start Queue", command=self.toggle_queue_processing)
+        self.start_pause_queue_button = ttk.Button(action_frame, text="Start Queue", command=self.toggle_queue_processing)
         self.start_pause_queue_button.pack(side=tk.LEFT, padx=5)
-        stop_button = ttk.Button(
-            action_frame, text="Stop Selected", command=self.stop_selected_downloads)
+        start_button = ttk.Button(action_frame, text="Start Selected", command=self.start_selected_downloads)
+        start_button.pack(side=tk.LEFT, padx=5)
+        stop_button = ttk.Button(action_frame, text="Stop Selected", command=self.stop_selected_downloads)
         stop_button.pack(side=tk.LEFT, padx=5)
-        spacer = ttk.Frame(action_frame)
-        spacer.pack(side=tk.LEFT, expand=True, fill=tk.X)
-        clear_completed_button = ttk.Button(
-            action_frame, text="Clear Completed", command=self.clear_completed_items)
-        clear_completed_button.pack(side=tk.RIGHT, padx=5)
-        remove_button = ttk.Button(
-            action_frame, text="Remove Selected", command=self.remove_selected_items)
-        remove_button.pack(side=tk.RIGHT, padx=5)
+        spacer = ttk.Frame(action_frame); spacer.pack(side=tk.LEFT, expand=True, fill=tk.X)
+        clear_completed_button = ttk.Button(action_frame, text="Clear Completed", command=self.clear_completed_items); clear_completed_button.pack(side=tk.RIGHT, padx=5)
+        remove_button = ttk.Button(action_frame, text="Remove Selected", command=self.remove_selected_items); remove_button.pack(side=tk.RIGHT, padx=5)
 
         list_frame = ttk.Frame(self.root, padding="10 0 10 10")
         list_frame.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
