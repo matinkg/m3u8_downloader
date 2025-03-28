@@ -212,6 +212,9 @@ class Downloader:
 
     def _update_status(self, status, progress=None):
         """ Safely send status update to the GUI queue. """
+        # Avoid sending updates if stop event is already set, reduces queue noise during stopping
+        if self.stop_event.is_set() and status not in ["Stopping...", "Stopped", "FINISHED"]:
+            return
         try:
             update = {"id": self.item_id, "status": status}
             if progress is not None:
@@ -240,7 +243,8 @@ class Downloader:
                 headers = {'User-Agent': USER_AGENT}
                 # Increased timeout for potentially larger segments or slow connections
                 response = session.get(segment_uri, stream=True, timeout=(
-                    10, 30), headers=headers)  # (connect_timeout, read_timeout)
+                    # (connect_timeout, read_timeout)
+                    10, 30), headers=headers)
                 response.raise_for_status()
 
                 with open(segment_filename, 'wb') as f:
@@ -281,7 +285,6 @@ class Downloader:
         print(f"Failed to download segment {index} after {attempts} attempts.")
         return False
 
-    # --- THIS IS THE UPDATED SUBTITLE FUNCTION ---
     def _download_subtitle(self, sub_info, session):
         """Downloads a single subtitle track, handling segmented VTT."""
         sub_url = sub_info['uri']
@@ -437,7 +440,6 @@ class Downloader:
             except OSError:
                 pass
             return False, None
-    # --- END OF UPDATED SUBTITLE FUNCTION ---
 
     def _download_and_save_extra_audio(self, audio_info, session):
         """ Uses ffmpeg to directly download and save an audio stream. """
@@ -777,8 +779,6 @@ class Downloader:
         final_output_video = os.path.join(
             self.item_output_dir, f"{self.filename_base}.mp4")
         downloaded_sub_paths = []
-        # Not explicitly tracked by path, success counted
-        downloaded_extra_audio_paths = []
         primary_audio_info = None
         all_audio_infos = []
         video_playlist_obj = None
@@ -984,6 +984,11 @@ class Downloader:
                 except OSError as e:
                     print(f"Warning: Error cleaning temp dir {temp_dir}: {e}")
 
+            # --- Crucial: Signal that this download thread has finished ---
+            if self.item_id:
+                self.gui_queue.put({"id": self.item_id, "status": "FINISHED"})
+            # --- End Signal ---
+
 
 # --- GUI Application Class ---
 class DownloadManagerApp:
@@ -1000,6 +1005,12 @@ class DownloadManagerApp:
         self.download_threads = {}
         self.downloader_instances = {}
         self.gui_queue = queue.Queue()
+
+        # --- New for Queue ---
+        self.active_download_count = 0
+        self.max_concurrent_var = tk.IntVar(
+            value=4)  # Default concurrency limit
+        # --- End New ---
 
         self.style = ttk.Style(root)
         try:
@@ -1061,6 +1072,16 @@ class DownloadManagerApp:
             settings_frame, text="Download All Subtitles", variable=self.download_subtitles)
         sub_check.grid(row=1, column=1, padx=(90, 0),
                        pady=5, sticky=tk.W, columnspan=2)
+
+        # --- New: Concurrency Limit (Row 2) ---
+        ttk.Label(settings_frame, text="Concurrent DLs:").grid(
+            row=2, column=0, padx=2, pady=5, sticky=tk.W)
+        concurrency_spinbox = ttk.Spinbox(settings_frame, from_=1, to=20, textvariable=self.max_concurrent_var,
+                                          # Add command to update status bar
+                                          width=5, state="readonly", command=self._update_active_status)
+        concurrency_spinbox.grid(row=2, column=1, padx=2, pady=5, sticky=tk.W)
+        # --- End New ---
+
         settings_frame.columnconfigure(1, weight=1)
 
         action_frame = ttk.Frame(self.root, padding="5 10")
@@ -1068,9 +1089,11 @@ class DownloadManagerApp:
         start_button = ttk.Button(
             action_frame, text="Start Selected", command=self.start_selected_downloads)
         start_button.pack(side=tk.LEFT, padx=5)
-        start_all_button = ttk.Button(
-            action_frame, text="Start All Pending", command=self.start_all_pending_downloads)
-        start_all_button.pack(side=tk.LEFT, padx=5)
+        # --- Rename "Start All Pending" to "Start Queue" ---
+        start_queue_button = ttk.Button(
+            action_frame, text="Start Queue", command=self.start_queue)
+        start_queue_button.pack(side=tk.LEFT, padx=5)
+        # --- End Rename ---
         stop_button = ttk.Button(
             action_frame, text="Stop Selected", command=self.stop_selected_downloads)
         stop_button.pack(side=tk.LEFT, padx=5)
@@ -1110,22 +1133,52 @@ class DownloadManagerApp:
         list_frame.grid_columnconfigure(0, weight=1)
 
         self.status_var = tk.StringVar(
-            value="Ready. Select Output Dir and Import Links.")
+            value=f"Ready (Max {self.max_concurrent_var.get()} concurrent). Select Output Dir and Import Links.")
         status_bar = ttk.Label(self.root, textvariable=self.status_var,
                                relief=tk.SUNKEN, anchor=tk.W, padding="2 5")
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
+    # --- GUI Methods ---
+    def _update_active_status(self):
+        """Updates the status bar to show current active/limit."""
+        try:
+            limit = self.max_concurrent_var.get()
+            self.status_var.set(
+                f"Downloads Active: {self.active_download_count}/{limit}")
+        except tk.TclError:  # Handle potential error during shutdown
+            pass
+
     def sort_column(self, col, reverse):
         try:
-            l = [(self.tree.set(k, col), k)
-                 for k in self.tree.get_children('')]
+            # Store tuples of (value, item_id)
+            l = []
+            for k in self.tree.get_children(''):
+                try:
+                    value = self.tree.set(k, col)
+                    l.append((value, k))
+                except tk.TclError:
+                    continue  # Skip if item deleted during fetch
+
+            # Sorting logic
             if col == "Progress":
-                l.sort(key=lambda t: int(
-                    t[0].replace('%', '')), reverse=reverse)
+                # Handle potential empty string or non-numeric progress values gracefully
+                def get_progress_val(item_tuple):
+                    try:
+                        return int(item_tuple[0].replace('%', '').strip())
+                    except:
+                        return -1  # Sort errors/empty strings first
+                l.sort(key=get_progress_val, reverse=reverse)
             else:
                 l.sort(key=lambda t: str(t[0]).lower(), reverse=reverse)
+
+            # Reorder items in tree
             for index, (val, k) in enumerate(l):
-                self.tree.move(k, '', index)
+                try:
+                    self.tree.move(k, '', index)
+                except tk.TclError:
+                    continue  # Skip if item deleted during move
+
+            # Update header command for next sort direction
             self.tree.heading(
                 col, command=lambda: self.sort_column(col, not reverse))
         except Exception as e:
@@ -1136,73 +1189,122 @@ class DownloadManagerApp:
             initialdir=self.output_directory.get(), parent=self.root)
         if directory:
             self.output_directory.set(directory)
-            self.status_var.set(f"Output directory: {directory}")
+            self._update_active_status()  # Update status
 
     def import_links(self):
         input_text = self.link_input.get("1.0", tk.END).strip()
         if not input_text:
             self.status_var.set("Input area empty.")
             return
+
         added_count = 0
-        links_to_add = []
+        links_to_add = []  # Collect items to add before processing
+
         try:
+            # Attempt to parse input as JSON
             data = json.loads(input_text)
+
+            # --- Process parsed JSON data ---
             if isinstance(data, list):
+                # Input is a JSON list
                 for item in data:
                     if isinstance(item, dict) and "url" in item:
+                        # Item is a dictionary like {"name": "...", "url": "..."}
                         url = item.get("url", "").strip()
                         if url:
                             links_to_add.append(
                                 {"name": item.get("name"), "url": url})
+                    elif isinstance(item, str) and item.strip().lower().startswith(('http', 'ftp')) and '.m3u8' in item.strip().lower():
+                        # Item is a string that looks like a valid URL
+                        url = item.strip()
+                        # Name will be generated later
+                        links_to_add.append({"name": None, "url": url})
+                    else:
+                        # Skip items in the list that are neither dicts with URL nor valid URL strings
+                        print(f"Skipping invalid JSON list item: {item}")
+
             elif isinstance(data, dict) and "url" in data:
+                # Input is a single JSON object like {"name": "...", "url": "..."}
                 url = data.get("url", "").strip()
                 if url:
                     links_to_add.append({"name": data.get("name"), "url": url})
             else:
-                raise ValueError("JSON not list or {name:, url:} object.")
+                # JSON was valid but not in expected format (list or single object with url)
+                raise ValueError(
+                    "JSON input must be a list (of URLs or {name:, url:} objects) or a single {name:, url:} object.")
+
         except json.JSONDecodeError:
+            # --- Input is NOT valid JSON, treat as newline-separated URLs ---
+            print("Input not valid JSON, treating as newline-separated URLs.")
             lines = input_text.splitlines()
             for line in lines:
                 url = line.strip()
+                # Basic validation for URL format and m3u8 extension
                 if url and url.lower().startswith(('http', 'ftp')) and '.m3u8' in url.lower():
+                    # Name will be generated later
                     links_to_add.append({"name": None, "url": url})
                 elif url:
-                    print(f"Skipping invalid/non-m3u8 URL: {url}")
+                    # Log skipped lines that aren't empty but don't look right
+                    print(f"Skipping invalid/non-m3u8 URL line: {url}")
+
+        except AttributeError as e:
+            # Catch the specific error if somehow missed by type checks
+            messagebox.showerror(
+                "Import Error", f"Import failed: Invalid data structure in JSON list?\n({e})", parent=self.root)
+            self._update_active_status()  # Update status bar
+            return
         except Exception as e:
+            # Catch other potential errors during processing
             messagebox.showerror(
                 "Import Error", f"Import failed: {e}", parent=self.root)
+            self._update_active_status()  # Update status bar
             return
 
-        default_name_counter = 1
+        # --- Generate names if missing and add collected items to download list ---
+        # Better default naming counter, considering existing DL_ items
+        default_name_counter = sum(
+            1 for item_id in self.download_items if self.download_items[item_id]['name'].startswith("DL_")) + 1
         for link_info in links_to_add:
             url = link_info["url"]
-            name = link_info["name"]
-            if not name:
+            name = link_info["name"]  # Can be None initially
+
+            # Generate name only if it's missing (was None)
+            if name is None:
                 try:
+                    # Attempt to create a descriptive name from URL components
                     path = urlparse(url).path
                     base = os.path.basename(path)
                     gen_name = os.path.splitext(base)[0] if base else ""
+                    # Fallback if generated name is generic or empty
                     if not gen_name or gen_name.lower() in ('video', 'manifest', 'playlist', 'index', 'master', 'chunklist'):
                         parent = os.path.basename(os.path.dirname(path))
                         gen_name = parent if parent else f"DL_{default_name_counter}"
                     name = gen_name.replace('-', ' ').replace('_', ' ').strip()
                     default_name_counter += 1
                 except Exception:
+                    # Absolute fallback if URL parsing fails
                     name = f"DL_{default_name_counter}"
                     default_name_counter += 1
+
+            # Add the item (with original or generated name) to the download list
             if self.add_download_item(name, url):
                 added_count += 1
+
+        # --- Final status update ---
         if added_count > 0:
+            # Clear input area only if successful adds
             self.link_input.delete("1.0", tk.END)
+            # Update main status
             self.status_var.set(f"Added {added_count} items.")
         else:
-            self.status_var.set("No valid new links found.")
+            self.status_var.set("No valid new links found or added.")
+        self._update_active_status()  # Update active download count status
 
     def add_download_item(self, name, url):
         item_id = url
         if item_id in self.download_items:
-            self.status_var.set(f"Skipped duplicate: {url[:60]}...")
-            return False
+            self._update_active_status()
+            return False  # Update status on skip
         safe_name = sanitize_filename(name)
         try:
             tree_id = self.tree.insert(
@@ -1216,61 +1318,120 @@ class DownloadManagerApp:
 
     def get_selected_item_ids(self): return self.tree.selection()
 
-    def start_downloads(self, item_ids_to_start):
+    def start_single_download(self, item_id):
+        """Starts a single download if prerequisites met. Increments active count."""
         output_dir = self.output_directory.get()
-        if not output_dir:
+        if not output_dir:  # Check base dir validity once
             messagebox.showerror(
-                "Error", "Output directory not set.", parent=self.root)
-            return
+                "Error", "Base Output directory is not set.", parent=self.root)
+            self.update_item_status(item_id, "Error: No Output Dir", 0)
+            return False
         try:
             os.makedirs(output_dir, exist_ok=True)
         except OSError as e:
             messagebox.showerror(
-                "Error", f"Cannot create output directory: {e}", parent=self.root)
-            return
-        pref_res = self.preferred_resolution.get()
-        pref_res = None if pref_res.lower() == "best" else pref_res
-        download_subs = self.download_subtitles.get()
-        started_count = 0
-        for item_id in item_ids_to_start:
-            if item_id in self.download_items:
-                task_info = self.download_items[item_id]
-                if task_info["status"] in ["Pending", "Stopped"] or "Error" in task_info["status"]:
-                    if item_id in self.download_threads and self.download_threads[item_id].is_alive():
-                        continue
-                    name = task_info["name"]
-                    url = task_info["url"]
-                    self.update_item_status(item_id, "Queued", 0)
-                    downloader = Downloader(url=url, output_dir=output_dir, filename_base=name,
-                                            preferred_res=pref_res, download_subs=download_subs, gui_queue=self.gui_queue)
-                    downloader.item_id = item_id
-                    self.downloader_instances[item_id] = downloader
-                    thread = threading.Thread(
-                        target=downloader.run_download, daemon=True, name=f"DL-{name[:10]}")  # Add thread name
-                    self.download_threads[item_id] = thread
-                    thread.start()
-                    started_count += 1
-        if started_count > 0:
-            self.status_var.set(f"Started {started_count} downloads.")
-        elif item_ids_to_start:
-            self.status_var.set("Selected items not startable.")
+                "Error", f"Cannot create base output directory: {e}", parent=self.root)
+            self.update_item_status(item_id, "Error: Output Dir Fail", 0)
+            return False
+
+        if item_id in self.download_items:
+            task_info = self.download_items[item_id]
+            name = task_info["name"]
+            url = task_info["url"]
+            self.update_item_status(item_id, "Starting...", 0)
+            pref_res = self.preferred_resolution.get()
+            pref_res = None if pref_res.lower() == "best" else pref_res
+            download_subs = self.download_subtitles.get()
+
+            downloader = Downloader(url=url, output_dir=output_dir, filename_base=name,
+                                    preferred_res=pref_res, download_subs=download_subs, gui_queue=self.gui_queue)
+            downloader.item_id = item_id
+            self.downloader_instances[item_id] = downloader
+            thread = threading.Thread(
+                target=downloader.run_download, daemon=True, name=f"DL-{name[:10]}")
+            self.download_threads[item_id] = thread
+
+            self.active_download_count += 1
+            thread.start()
+            print(
+                f"Started download for {name}. Active: {self.active_download_count}/{self.max_concurrent_var.get()}")
+            self._update_active_status()
+            return True
+        else:
+            print(f"Cannot start download: Item {item_id} not found.")
+            return False
+
+    def _check_and_start_pending(self):
+        """Checks if new downloads can start and starts the next pending one(s)."""
+        if self.stop_event.is_set():
+            return  # Avoid starting new if app closing
+        try:
+            limit = self.max_concurrent_var.get()
+        except (tk.TclError, AttributeError):
+            limit = 0  # Handle GUI closing errors
+
+        while self.active_download_count < limit:
+            next_pending_id = None
+            # Find next PENDING item based on current tree order
+            for item_id in self.tree.get_children(''):
+                # Check internal dict for status reliability
+                if item_id in self.download_items and self.download_items[item_id]["status"] == "Pending":
+                    next_pending_id = item_id
+                    break
+            if next_pending_id:
+                print(
+                    f"Slot available. Attempting start: {self.download_items[next_pending_id]['name']}")
+                if not self.start_single_download(next_pending_id):
+                    break  # Stop trying if start fails
+                # Loop continues if start succeeds to check for more slots
+            else:
+                break  # No more pending items found
+        self._update_active_status()  # Ensure status bar is up-to-date
 
     def start_selected_downloads(self):
+        """Starts selected PENDING downloads up to the concurrency limit."""
         selected_ids = self.get_selected_item_ids()
         if not selected_ids:
-            self.status_var.set("No items selected.")
-            return
-        self.start_downloads(selected_ids)
+            self._update_active_status()
+            return  # Update status on exit
+        started_count = 0
+        limit = self.max_concurrent_var.get()
+        queued_count = 0
 
-    def start_all_pending_downloads(self):
-        pending_ids = [
-            id for id, info in self.download_items.items() if info["status"] == "Pending"]
-        if not pending_ids:
-            self.status_var.set("No pending items.")
-            return
-        self.start_downloads(pending_ids)
+        for item_id in selected_ids:
+            if item_id in self.download_items and self.download_items[item_id]["status"] == "Pending":
+                if self.active_download_count < limit:
+                    if self.start_single_download(item_id):
+                        started_count += 1
+                else:
+                    # Mark as Queued explicitly if limit reached? Optional.
+                    # self.update_item_status(item_id, "Queued", 0) # Mark as queued instead of just pending
+                    queued_count += 1
+
+        status_msg = ""
+        if started_count > 0:
+            status_msg += f"Started {started_count} selected. "
+        if queued_count > 0:
+            status_msg += f"{queued_count} waiting for slot. "
+        if not status_msg:
+            status_msg = "Selected items not pending or limit reached. "
+
+        self.status_var.set(
+            status_msg + f"Active: {self.active_download_count}/{limit}")
+        # Trigger check in case changing status made slots available (unlikely here but good practice)
+        # self._check_and_start_pending() # Maybe not needed if Start Queue button is primary way
+
+    def start_queue(self):
+        """Initiates the download queue process."""
+        self._update_active_status()  # Update status initially
+        print("Starting queue processing...")
+        # Call check_and_start multiple times initially to fill empty slots
+        limit = self.max_concurrent_var.get()
+        for _ in range(limit):
+            self._check_and_start_pending()
 
     def stop_downloads(self, item_ids_to_stop):
+        """Signals downloader threads to stop."""
         stopped_count = 0
         for item_id in item_ids_to_stop:
             task_info = self.download_items.get(item_id)
@@ -1283,28 +1444,29 @@ class DownloadManagerApp:
                         downloader.stop_event.set()
                         self.update_item_status(item_id, "Stopping...")
                         stopped_count += 1
-                elif task_info["status"] not in ["Completed", "Stopped", "Error"]:
+                # If instance exists but thread dead/missing
+                elif task_info["status"] not in ["Completed", "Stopped", "Error", "Pending"]:
                     self.update_item_status(item_id, "Stopped")
                     stopped_count += 1
             elif task_info["status"] in ["Pending", "Queued"]:
                 self.update_item_status(item_id, "Stopped")
                 stopped_count += 1
         if stopped_count > 0:
-            self.status_var.set(f"Requested stop for {stopped_count} items.")
+            self._update_active_status()  # Update status bar
         elif item_ids_to_stop:
             self.status_var.set("Selected items not stoppable.")
 
     def stop_selected_downloads(self):
         selected_ids = self.get_selected_item_ids()
         if not selected_ids:
-            self.status_var.set("No items selected.")
+            self._update_active_status()
             return
         self.stop_downloads(selected_ids)
 
     def remove_selected_items(self):
         selected_ids = self.get_selected_item_ids()
         if not selected_ids:
-            self.status_var.set("No items selected.")
+            self._update_active_status()
             return
         active_ids = [id for id in selected_ids if self.download_items.get(
             id, {}).get("status") not in ["Pending", "Completed", "Stopped", "Error"]]
@@ -1318,11 +1480,25 @@ class DownloadManagerApp:
                 time.sleep(0.1)
             removed_count = 0
             ids_to_delete = list(selected_ids)
+            needs_queue_check = False
             for item_id in ids_to_delete:
                 if item_id in self.download_items:
+                    task_info = self.download_items[item_id]
+                    was_active = task_info["status"] not in [
+                        "Pending", "Completed", "Stopped", "Error"]
                     if item_id in self.downloader_instances:
                         self.downloader_instances[item_id].stop_event.set()
-                    tree_id = self.download_items[item_id]["tree_id"]
+                    if was_active:  # Manually decrement if removing an active item that might not send FINISHED
+                        thread_alive = item_id in self.download_threads and self.download_threads[item_id].is_alive(
+                        )
+                        # Decrement only if thread seems dead or non-existent but was counted active
+                        if not thread_alive and self.active_download_count > 0:
+                            self.active_download_count -= 1
+                            needs_queue_check = True
+                            print(
+                                f"Manually decremented active count for removed item {item_id}. Active: {self.active_download_count}")
+
+                    tree_id = task_info["tree_id"]
                     if self.tree.exists(tree_id):
                         self.tree.delete(tree_id)
                     if item_id in self.download_threads:
@@ -1332,7 +1508,9 @@ class DownloadManagerApp:
                     del self.download_items[item_id]
                     removed_count += 1
             if removed_count > 0:
-                self.status_var.set(f"Removed {removed_count} items.")
+                self._update_active_status()  # Update status bar
+            if needs_queue_check:
+                self._check_and_start_pending()  # Check queue if slots might be free
         else:
             self.status_var.set("Removal cancelled.")
 
@@ -1340,7 +1518,7 @@ class DownloadManagerApp:
         completed_ids = [id for id, info in self.download_items.items(
         ) if info["status"] == "Completed"]
         if not completed_ids:
-            self.status_var.set("No completed items.")
+            self._update_active_status()
             return
         removed_count = 0
         for item_id in completed_ids:
@@ -1355,15 +1533,15 @@ class DownloadManagerApp:
                 del self.download_items[item_id]
                 removed_count += 1
         if removed_count > 0:
-            self.status_var.set(f"Cleared {removed_count} completed items.")
+            self._update_active_status()  # Update status bar
 
     def update_item_status(self, item_id, status, progress=None):
         if item_id in self.download_items:
             task_info = self.download_items[item_id]
             tree_id = task_info["tree_id"]
             if not self.tree.exists(tree_id):
-                if item_id in self.downloader_instances:
-                    self.downloader_instances[item_id].stop_event.set()
+                # If item removed from UI, ensure counter is correct if it was active
+                # This is tricky, FINISHED signal is more reliable
                 return
             try:
                 current_values = list(self.tree.item(tree_id, 'values'))
@@ -1387,47 +1565,76 @@ class DownloadManagerApp:
                 print(f"Error updating GUI for {item_id}: {e}")
 
     def process_gui_queue(self):
+        """Processes status messages AND finish signals from download threads."""
         try:
-            while True:
+            while True:  # Process all available messages
                 update = self.gui_queue.get_nowait()
-                item_id, status, progress = update.get(
-                    "id"), update.get("status"), update.get("progress")
-                if item_id:
+                item_id = update.get("id")
+                status = update.get("status")
+                progress = update.get("progress")
+                if not item_id:
+                    continue
+
+                # --- Handle the special FINISHED signal ---
+                if status == "FINISHED":
+                    # Check if the item still exists conceptually (even if removed from UI maybe?)
+                    # Decrement count ONLY if it was considered active
+                    # We rely on the fact that FINISHED is sent only once per thread execution.
+                    if item_id in self.downloader_instances:  # Check if we tracked this instance
+                        if self.active_download_count > 0:
+                            self.active_download_count -= 1
+                            print(
+                                f"Download finished/stopped ({self.download_items.get(item_id, {}).get('name', '?')}). Active: {self.active_download_count}/{self.max_concurrent_var.get()}")
+                            # Since a slot is now free, check if we can start the next pending item
+                            self._check_and_start_pending()
+                        else:
+                            print(
+                                "Warning: FINISHED signal received but active_count was already 0.")
+                        # Clean up instance ref after finish signal? Or leave until removed? Leaving seems ok.
+                        # if item_id in self.downloader_instances: del self.downloader_instances[item_id]
+                    # else: Item was likely removed, count might have been manually decremented.
+
+                # --- Handle regular status updates ---
+                else:
                     self.update_item_status(item_id, status, progress)
+
         except queue.Empty:
-            pass
+            pass  # No messages left
         except Exception as e:
             print(f"Error processing GUI queue: {e}")
+            traceback.print_exc()
         finally:
-            self.root.after(100, self.process_gui_queue)
+            self.root.after(100, self.process_gui_queue)  # Reschedule
 
     def on_closing(self):
-        active_threads = [
-            t for t in self.download_threads.values() if t.is_alive()]
-        confirm = True
-        if active_threads:
-            confirm = messagebox.askokcancel(
-                "Quit", f"{len(active_threads)} downloads active. Quit anyway?", parent=self.root)
-        if confirm:
-            print("Stopping active downloads on exit...")
-            for instance in self.downloader_instances.values():
-                instance.stop_event.set()
+        """Handle window close event (WM_DELETE_WINDOW)."""
+        self.stop_event.set()  # Set app-wide stop event
+        if self.active_download_count > 0:
+            if messagebox.askokcancel("Quit", f"{self.active_download_count} downloads active. Quit anyway?", parent=self.root):
+                print("Stopping active downloads on exit...")
+                for instance in self.downloader_instances.values():
+                    instance.stop_event.set()
+                self.root.destroy()
+        else:
             self.root.destroy()
 
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    # Add traceback for unhandled exceptions in the main thread (GUI)
-    def show_error(exc_type, exc_value, tb):
+    def show_error(exc_type, exc_value, tb):  # Basic Tkinter exception handler
         message = f"Unhandled Exception:\n{exc_type.__name__}: {exc_value}\n"
         message += "".join(traceback.format_tb(tb))
         print(message)  # Print to console
-        # Optionally show in a messagebox, but be careful with GUI state during exceptions
-        # messagebox.showerror("Unhandled Exception", message[:2000]) # Limit message length
-
-    # Hook into Tkinter's exception reporting
+        try:
+            # Show in GUI if possible
+            messagebox.showerror("Unhandled Exception", message[:2000])
+        except:
+            pass  # Avoid errors during error reporting
     tk.Tk.report_callback_exception = show_error
 
     root = tk.Tk()
+    # Add internal stop event for the app itself
     app = DownloadManagerApp(root)
+    app.stop_event = threading.Event()  # Used in _check_and_start_pending
+
     root.mainloop()
