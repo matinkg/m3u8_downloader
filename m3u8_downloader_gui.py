@@ -867,14 +867,22 @@ class Downloader:
                     future_to_sub = {sub_executor.submit(
                         self._download_subtitle, sub_info, session): sub_info for sub_info in all_subtitle_infos}
                     for future in concurrent.futures.as_completed(future_to_sub):
+                        if self.stop_event.is_set():
+                            future.cancel()
+                            continue  # Check stop event during sub downloads
                         sub_info = future_to_sub[future]
                         try:
                             success, saved_path = future.result()
                             if success and saved_path:
                                 downloaded_sub_paths.append(saved_path)
+                        except concurrent.futures.CancelledError:
+                            pass  # Ignore cancelled futures
                         except Exception as exc:
                             print(
                                 f"Subtitle DL ({sub_info.get('lang')}) error: {exc}")
+
+            if self.stop_event.is_set():
+                raise InterruptedError("Stopped during subtitle download")
 
             # --- Download Video Segments ---
             if self.stop_event.is_set():
@@ -914,11 +922,16 @@ class Downloader:
                     future_to_audio = {extra_audio_executor.submit(
                         self._download_and_save_extra_audio, audio_info, session): audio_info for audio_info in extra_audio_infos}
                     for future in concurrent.futures.as_completed(future_to_audio):
+                        if self.stop_event.is_set():
+                            future.cancel()
+                            continue  # Check stop event
                         audio_info = future_to_audio[future]
                         try:
                             success = future.result()
                             if success:
                                 extra_audio_success_count += 1
+                        except concurrent.futures.CancelledError:
+                            pass  # Ignore cancelled futures
                         except Exception as exc:
                             print(
                                 f"Extra audio DL ({audio_info.get('lang')}) error: {exc}")
@@ -952,7 +965,8 @@ class Downloader:
                     final_message += f" | Subs: {len(downloaded_sub_paths)}"
                 # Count total audio tracks successfully saved (primary in MP4 + extras)
                 num_primary_audio = 1 if (primary_audio_info and downloaded_primary_audio_count > 0) or (
-                    not primary_audio_info) else 0  # Count primary if merged or muxed
+                    # Count primary if merged or muxed (and video exists)
+                    not primary_audio_info and downloaded_video_count > 0) else 0
                 total_successful_audio = num_primary_audio + extra_audio_success_count
                 if total_successful_audio > 0:
                     final_message += f" | Audios: {total_successful_audio}"
@@ -971,7 +985,7 @@ class Downloader:
             print(f"Value Error: {e}")
             self._update_status(f"Error: {e}")
         except Exception as e:
-            print(f"Unexpected error: {e}")
+            print(f"Unexpected error in run_download: {e}")
             traceback.print_exc()
             self._update_status(f"Error: Unexpected")
 
@@ -1006,11 +1020,12 @@ class DownloadManagerApp:
         self.downloader_instances = {}
         self.gui_queue = queue.Queue()
 
-        # --- New for Queue ---
+        # --- Queue State ---
         self.active_download_count = 0
         self.max_concurrent_var = tk.IntVar(
             value=4)  # Default concurrency limit
-        # --- End New ---
+        self.queue_processing_enabled = False  # Queue is initially paused
+        # --- End Queue State ---
 
         self.style = ttk.Style(root)
         try:
@@ -1028,6 +1043,8 @@ class DownloadManagerApp:
 
         self._create_widgets()
         self._check_ffmpeg()
+        # Add app stop event for graceful shutdown checks
+        self.stop_event = threading.Event()
         self.root.after(100, self.process_gui_queue)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -1073,14 +1090,12 @@ class DownloadManagerApp:
         sub_check.grid(row=1, column=1, padx=(90, 0),
                        pady=5, sticky=tk.W, columnspan=2)
 
-        # --- New: Concurrency Limit (Row 2) ---
+        # Concurrency Limit Setting
         ttk.Label(settings_frame, text="Concurrent DLs:").grid(
             row=2, column=0, padx=2, pady=5, sticky=tk.W)
         concurrency_spinbox = ttk.Spinbox(settings_frame, from_=1, to=20, textvariable=self.max_concurrent_var,
-                                          # Add command to update status bar
-                                          width=5, state="readonly", command=self._update_active_status)
+                                          width=5, state="readonly", command=self._on_concurrency_change)
         concurrency_spinbox.grid(row=2, column=1, padx=2, pady=5, sticky=tk.W)
-        # --- End New ---
 
         settings_frame.columnconfigure(1, weight=1)
 
@@ -1089,11 +1104,10 @@ class DownloadManagerApp:
         start_button = ttk.Button(
             action_frame, text="Start Selected", command=self.start_selected_downloads)
         start_button.pack(side=tk.LEFT, padx=5)
-        # --- Rename "Start All Pending" to "Start Queue" ---
-        start_queue_button = ttk.Button(
-            action_frame, text="Start Queue", command=self.start_queue)
-        start_queue_button.pack(side=tk.LEFT, padx=5)
-        # --- End Rename ---
+        # Queue Toggle Button
+        self.start_pause_queue_button = ttk.Button(
+            action_frame, text="Start Queue", command=self.toggle_queue_processing)
+        self.start_pause_queue_button.pack(side=tk.LEFT, padx=5)
         stop_button = ttk.Button(
             action_frame, text="Stop Selected", command=self.stop_selected_downloads)
         stop_button.pack(side=tk.LEFT, padx=5)
@@ -1132,53 +1146,70 @@ class DownloadManagerApp:
         list_frame.grid_rowconfigure(0, weight=1)
         list_frame.grid_columnconfigure(0, weight=1)
 
+        # Initial Status Bar Message
         self.status_var = tk.StringVar(
-            value=f"Ready (Max {self.max_concurrent_var.get()} concurrent). Select Output Dir and Import Links.")
+            value=f"Ready (Queue Paused | Max {self.max_concurrent_var.get()} concurrent)")
         status_bar = ttk.Label(self.root, textvariable=self.status_var,
                                relief=tk.SUNKEN, anchor=tk.W, padding="2 5")
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
     # --- GUI Methods ---
     def _update_active_status(self):
-        """Updates the status bar to show current active/limit."""
+        """Updates the status bar to show current active/limit and queue state."""
         try:
             limit = self.max_concurrent_var.get()
+            queue_state = "Running" if self.queue_processing_enabled else "Paused"
+            # Determine if truly idle (no active, no pending)
+            has_pending = any(
+                info["status"] == "Pending" for info in self.download_items.values())
+            if not self.queue_processing_enabled and self.active_download_count == 0 and not has_pending:
+                queue_state = "Idle"
             self.status_var.set(
-                f"Downloads Active: {self.active_download_count}/{limit}")
-        except tk.TclError:  # Handle potential error during shutdown
-            pass
+                f"Queue: {queue_state} | Active: {self.active_download_count}/{limit}")
+        except (tk.TclError, AttributeError):
+            self.status_var.set("Status unavailable...")
+
+    def _on_concurrency_change(self):
+        """Called when the concurrency spinbox value changes."""
+        self._update_active_status()
+        # If queue is running and limit increased, check if we can start more
+        if self.queue_processing_enabled:
+            self._check_and_start_pending()
+
+    def toggle_queue_processing(self):
+        """Starts or pauses the automatic processing of the download queue."""
+        self.queue_processing_enabled = not self.queue_processing_enabled
+        if self.queue_processing_enabled:
+            print("Queue processing ENABLED.")
+            self.start_pause_queue_button.config(text="Pause Queue")
+            self._check_and_start_pending()  # Immediately check if we can start downloads
+        else:
+            print("Queue processing PAUSED.")
+            self.start_pause_queue_button.config(text="Start Queue")
+        self._update_active_status()  # Update status bar
 
     def sort_column(self, col, reverse):
         try:
-            # Store tuples of (value, item_id)
-            l = []
+            l = []  # Store tuples of (value, item_id)
             for k in self.tree.get_children(''):
                 try:
-                    value = self.tree.set(k, col)
-                    l.append((value, k))
+                    l.append((self.tree.set(k, col), k))
                 except tk.TclError:
-                    continue  # Skip if item deleted during fetch
-
-            # Sorting logic
+                    continue  # Skip deleted item
             if col == "Progress":
-                # Handle potential empty string or non-numeric progress values gracefully
-                def get_progress_val(item_tuple):
+                def get_progress_val(t):
                     try:
-                        return int(item_tuple[0].replace('%', '').strip())
+                        return int(t[0].replace('%', '').strip())
                     except:
-                        return -1  # Sort errors/empty strings first
+                        return -1  # Sort errors first
                 l.sort(key=get_progress_val, reverse=reverse)
             else:
                 l.sort(key=lambda t: str(t[0]).lower(), reverse=reverse)
-
-            # Reorder items in tree
             for index, (val, k) in enumerate(l):
                 try:
                     self.tree.move(k, '', index)
                 except tk.TclError:
-                    continue  # Skip if item deleted during move
-
-            # Update header command for next sort direction
+                    continue  # Skip deleted item
             self.tree.heading(
                 col, command=lambda: self.sort_column(col, not reverse))
         except Exception as e:
@@ -1189,7 +1220,7 @@ class DownloadManagerApp:
             initialdir=self.output_directory.get(), parent=self.root)
         if directory:
             self.output_directory.set(directory)
-            self._update_active_status()  # Update status
+            self._update_active_status()
 
     def import_links(self):
         input_text = self.link_input.get("1.0", tk.END).strip()
@@ -1304,7 +1335,7 @@ class DownloadManagerApp:
         item_id = url
         if item_id in self.download_items:
             self._update_active_status()
-            return False  # Update status on skip
+            return False
         safe_name = sanitize_filename(name)
         try:
             tree_id = self.tree.insert(
@@ -1321,9 +1352,9 @@ class DownloadManagerApp:
     def start_single_download(self, item_id):
         """Starts a single download if prerequisites met. Increments active count."""
         output_dir = self.output_directory.get()
-        if not output_dir:  # Check base dir validity once
+        if not output_dir:
             messagebox.showerror(
-                "Error", "Base Output directory is not set.", parent=self.root)
+                "Error", "Base Output directory not set.", parent=self.root)
             self.update_item_status(item_id, "Error: No Output Dir", 0)
             return False
         try:
@@ -1352,7 +1383,7 @@ class DownloadManagerApp:
             self.download_threads[item_id] = thread
 
             self.active_download_count += 1
-            thread.start()
+            thread.start()  # Increment BEFORE start
             print(
                 f"Started download for {name}. Active: {self.active_download_count}/{self.max_concurrent_var.get()}")
             self._update_active_status()
@@ -1362,73 +1393,68 @@ class DownloadManagerApp:
             return False
 
     def _check_and_start_pending(self):
-        """Checks if new downloads can start and starts the next pending one(s)."""
+        """Checks if new downloads can start (if queue enabled) and starts next pending."""
         if self.stop_event.is_set():
-            return  # Avoid starting new if app closing
+            return  # App closing
+        if not self.queue_processing_enabled:
+            self._update_active_status()
+            return  # Queue paused
         try:
             limit = self.max_concurrent_var.get()
         except (tk.TclError, AttributeError):
-            limit = 0  # Handle GUI closing errors
+            limit = 0
 
         while self.active_download_count < limit:
             next_pending_id = None
-            # Find next PENDING item based on current tree order
+            # Find next PENDING in visual order
             for item_id in self.tree.get_children(''):
-                # Check internal dict for status reliability
                 if item_id in self.download_items and self.download_items[item_id]["status"] == "Pending":
                     next_pending_id = item_id
                     break
             if next_pending_id:
                 print(
-                    f"Slot available. Attempting start: {self.download_items[next_pending_id]['name']}")
+                    f"Queue: Slot available. Starting: {self.download_items[next_pending_id]['name']}")
                 if not self.start_single_download(next_pending_id):
-                    break  # Stop trying if start fails
-                # Loop continues if start succeeds to check for more slots
+                    break  # Stop if start fails
             else:
-                break  # No more pending items found
-        self._update_active_status()  # Ensure status bar is up-to-date
+                break  # No more pending items
+        # Update status bar after checking/starting
+        self._update_active_status()
 
     def start_selected_downloads(self):
-        """Starts selected PENDING downloads up to the concurrency limit."""
+        """Starts selected PENDING downloads up to the concurrency limit. Ignores queue enabled state."""
         selected_ids = self.get_selected_item_ids()
         if not selected_ids:
             self._update_active_status()
-            return  # Update status on exit
+            return
         started_count = 0
         limit = self.max_concurrent_var.get()
-        queued_count = 0
+        processed_count = 0
+        limit_hit = False
 
         for item_id in selected_ids:
+            processed_count += 1
             if item_id in self.download_items and self.download_items[item_id]["status"] == "Pending":
                 if self.active_download_count < limit:
                     if self.start_single_download(item_id):
                         started_count += 1
                 else:
-                    # Mark as Queued explicitly if limit reached? Optional.
-                    # self.update_item_status(item_id, "Queued", 0) # Mark as queued instead of just pending
-                    queued_count += 1
+                    limit_hit = True
+                    break  # Stop trying if limit reached
 
         status_msg = ""
         if started_count > 0:
             status_msg += f"Started {started_count} selected. "
-        if queued_count > 0:
-            status_msg += f"{queued_count} waiting for slot. "
-        if not status_msg:
+        if limit_hit:
+            status_msg += f"Limit ({limit}) reached. "
+        if not status_msg and selected_ids:
             status_msg = "Selected items not pending or limit reached. "
 
-        self.status_var.set(
-            status_msg + f"Active: {self.active_download_count}/{limit}")
-        # Trigger check in case changing status made slots available (unlikely here but good practice)
-        # self._check_and_start_pending() # Maybe not needed if Start Queue button is primary way
-
-    def start_queue(self):
-        """Initiates the download queue process."""
-        self._update_active_status()  # Update status initially
-        print("Starting queue processing...")
-        # Call check_and_start multiple times initially to fill empty slots
-        limit = self.max_concurrent_var.get()
-        for _ in range(limit):
-            self._check_and_start_pending()
+        if status_msg:
+            self.status_var.set(
+                status_msg + f"Active: {self.active_download_count}/{limit}")
+        else:
+            self._update_active_status()  # Fallback update
 
     def stop_downloads(self, item_ids_to_stop):
         """Signals downloader threads to stop."""
@@ -1444,7 +1470,6 @@ class DownloadManagerApp:
                         downloader.stop_event.set()
                         self.update_item_status(item_id, "Stopping...")
                         stopped_count += 1
-                # If instance exists but thread dead/missing
                 elif task_info["status"] not in ["Completed", "Stopped", "Error", "Pending"]:
                     self.update_item_status(item_id, "Stopped")
                     stopped_count += 1
@@ -1452,7 +1477,7 @@ class DownloadManagerApp:
                 self.update_item_status(item_id, "Stopped")
                 stopped_count += 1
         if stopped_count > 0:
-            self._update_active_status()  # Update status bar
+            self._update_active_status()
         elif item_ids_to_stop:
             self.status_var.set("Selected items not stoppable.")
 
@@ -1484,15 +1509,14 @@ class DownloadManagerApp:
             for item_id in ids_to_delete:
                 if item_id in self.download_items:
                     task_info = self.download_items[item_id]
-                    was_active = task_info["status"] not in [
+                    was_counted_active = task_info["status"] not in [
                         "Pending", "Completed", "Stopped", "Error"]
                     if item_id in self.downloader_instances:
                         self.downloader_instances[item_id].stop_event.set()
-                    if was_active:  # Manually decrement if removing an active item that might not send FINISHED
+                    if was_counted_active:  # Manually adjust count ONLY if removing an item that was active
                         thread_alive = item_id in self.download_threads and self.download_threads[item_id].is_alive(
                         )
-                        # Decrement only if thread seems dead or non-existent but was counted active
-                        if not thread_alive and self.active_download_count > 0:
+                        if not thread_alive and self.active_download_count > 0:  # If wasn't running, won't send FINISHED
                             self.active_download_count -= 1
                             needs_queue_check = True
                             print(
@@ -1533,16 +1557,14 @@ class DownloadManagerApp:
                 del self.download_items[item_id]
                 removed_count += 1
         if removed_count > 0:
-            self._update_active_status()  # Update status bar
+            self._update_active_status()
 
     def update_item_status(self, item_id, status, progress=None):
         if item_id in self.download_items:
             task_info = self.download_items[item_id]
             tree_id = task_info["tree_id"]
             if not self.tree.exists(tree_id):
-                # If item removed from UI, ensure counter is correct if it was active
-                # This is tricky, FINISHED signal is more reliable
-                return
+                return  # Item removed from UI
             try:
                 current_values = list(self.tree.item(tree_id, 'values'))
                 needs_update = False
@@ -1577,22 +1599,20 @@ class DownloadManagerApp:
 
                 # --- Handle the special FINISHED signal ---
                 if status == "FINISHED":
-                    # Check if the item still exists conceptually (even if removed from UI maybe?)
-                    # Decrement count ONLY if it was considered active
-                    # We rely on the fact that FINISHED is sent only once per thread execution.
-                    if item_id in self.downloader_instances:  # Check if we tracked this instance
+                    # Check if we were tracking this instance when it finished
+                    if item_id in self.downloader_instances:
                         if self.active_download_count > 0:
                             self.active_download_count -= 1
                             print(
                                 f"Download finished/stopped ({self.download_items.get(item_id, {}).get('name', '?')}). Active: {self.active_download_count}/{self.max_concurrent_var.get()}")
-                            # Since a slot is now free, check if we can start the next pending item
+                            # Since a slot is free, check queue
                             self._check_and_start_pending()
                         else:
                             print(
                                 "Warning: FINISHED signal received but active_count was already 0.")
-                        # Clean up instance ref after finish signal? Or leave until removed? Leaving seems ok.
+                        # Remove instance ref now? Maybe better than leaving dangling refs?
                         # if item_id in self.downloader_instances: del self.downloader_instances[item_id]
-                    # else: Item was likely removed, count might have been manually decremented.
+                    # else: Instance might have been removed already. Count adjusted manually?
 
                 # --- Handle regular status updates ---
                 else:
@@ -1608,12 +1628,14 @@ class DownloadManagerApp:
 
     def on_closing(self):
         """Handle window close event (WM_DELETE_WINDOW)."""
-        self.stop_event.set()  # Set app-wide stop event
+        self.stop_event.set()  # Signal background checks to stop
         if self.active_download_count > 0:
             if messagebox.askokcancel("Quit", f"{self.active_download_count} downloads active. Quit anyway?", parent=self.root):
                 print("Stopping active downloads on exit...")
                 for instance in self.downloader_instances.values():
                     instance.stop_event.set()
+                # Wait a very brief moment allows threads to potentially acknowledge stop
+                # time.sleep(0.1) # Optional small delay
                 self.root.destroy()
         else:
             self.root.destroy()
@@ -1633,8 +1655,5 @@ if __name__ == "__main__":
     tk.Tk.report_callback_exception = show_error
 
     root = tk.Tk()
-    # Add internal stop event for the app itself
     app = DownloadManagerApp(root)
-    app.stop_event = threading.Event()  # Used in _check_and_start_pending
-
     root.mainloop()
